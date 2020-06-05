@@ -21,7 +21,7 @@ $(function() {
       }),
       success: function (data) {
         var newNode = $("<li></li>");
-        newNode.text(data.message);
+        newNode.text("eggs " + data.message);
         console.log(data);
         $("##{rawJS commentListId}").append(newNode);
       },
