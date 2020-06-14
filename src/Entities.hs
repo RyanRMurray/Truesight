@@ -8,6 +8,8 @@ module Entities where
     import Data.Maybe (mapMaybe, listToMaybe)
 
 
+    type InitiativeScore = Float
+
     data Meter = Uncapped
         { value     :: Int
         }
@@ -22,8 +24,8 @@ module Entities where
 
     -- maximise meter
     (>^) :: Meter -> Meter
-    (>^) Uncapped{..} = Uncapped value
-    (>^) Capped{..}   = Capped max_value max_value
+    (>^) u@Uncapped{..} = u
+    (>^) Capped{..}     = Capped max_value max_value
 
     -- alter meter
     (>+) :: Meter -> Int -> Meter
@@ -68,6 +70,10 @@ module Entities where
         , statuses  :: [Status]
         }
         | Group [Entity]
+        | Interruption
+        { entity_id   :: String
+        , description :: String
+        }
 
     instance Show Entity where
         show Single{..} =
@@ -79,8 +85,11 @@ module Entities where
 
         show (Group es) = concatMap show es
 
+        show Interruption{..} = entity_id ++ ": " ++ description
+
     -- decay any timed statuses
     step_entity :: Entity -> Entity
+    step_entity i@Interruption {..} = i
     step_entity (Group es) = Group $ map step_entity es
     step_entity Single{..} = Single
         entity_id
@@ -94,15 +103,23 @@ module Entities where
         statuses
     ms_adjust _ _ _ = undefined
 
+    --Group two entity types together.
+    entity_union :: Entity -> Entity -> Entity
+    entity_union (Group es1)   (Group es2)   = Group $ es1 ++ es2
+    entity_union e1            (Group es)    = Group (e1:es)
+    entity_union es@(Group _)  e1            = entity_union e1 es
+    entity_union e1            e2            = Group [e1,e2]
+
+
     {--
         Initiative is the state of a given combat. There is an initiative counter that counts down
-        from the highest rolled number to the lowest, plus any possible interruptions (TODO)
+        from the highest rolled number to the lowest, plus any possible interruptions
 
 
     --}
     data Initiative = Initiative
-        { counter  :: Float
-        , entities :: Map Float Entity
+        { counter  :: InitiativeScore
+        , entities :: Map InitiativeScore Entity
         , rounds   :: Int
         }
 
@@ -127,10 +144,27 @@ module Entities where
                     (M.adjust step_entity counter entities)
                     rounds
                 Nothing -> Initiative
-                    (last $ M.keys entities)
+                    (fst $ M.findMax entities)
                     (M.adjust step_entity counter entities)
                     (rounds + 1)
 
+
+    --add an entity to the initiative order, grouping by initiative score
+    add_entity :: Initiative -> InitiativeScore -> Entity -> Initiative
+    add_entity Initiative{..} i e1 =
+        let bucket = entities M.!? i
+        in
+            case bucket of
+                Nothing -> Initiative
+                    counter
+                    (M.insert i e1 entities)
+                    rounds
+                Just e2 -> Initiative
+                    counter
+                    (M.insert i (entity_union e1 e2) entities)
+                    rounds
+
+            
 
 
 
