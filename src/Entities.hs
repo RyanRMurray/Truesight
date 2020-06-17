@@ -1,15 +1,40 @@
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TemplateHaskell #-}
 module Entities where
 
 
     import Data.Map (Map)
     import qualified Data.Map as M
+    import Data.Set (Set)
+    import qualified Data.Set as S
+    import Data.List (sortOn)
 
-    import Data.Maybe (mapMaybe, listToMaybe)
+    import Data.Maybe (mapMaybe)
+
+    import Lens.Micro.Platform
+
+
 
 
     type InitiativeScore = Float
+    type EntityID = Int
 
+
+    {--
+        Flags are generated when an event occurs that may affect something in the current combat,
+        such as a character's turn ending. They may optionally carry extra data, such as whose turn
+        has ended.
+    --}
+
+    data Flag = 
+          TurnStart EntityID
+        | TurnEnd   EntityID
+        | RoundEnd
+        deriving (Eq, Ord)
+
+
+
+    -- Meters store arbitrary integer values, optionally with a maximum value
     data Meter = Uncapped
         { value     :: Int
         }
@@ -21,6 +46,7 @@ module Entities where
     instance Show Meter where
         show (Uncapped m) = show m
         show (Capped v m) = show v ++ "/" ++ show m
+
 
     -- maximise meter
     (>^) :: Meter -> Meter
@@ -45,129 +71,154 @@ module Entities where
         in
             foldl insert' M.empty
 
-    -- Statuses either decay over time or are removed manually.
+    -- Statuses either decay when a specified flag occurs or are removed manually.
     data Status = Decaying
-        { status_id :: String
-        , timer     :: Int
+        { status_name :: String
+        , timer       :: Int
+        , decay_flags :: Set Flag
         }
-        | Permanent {status_id :: String}
+        | Permanent {status_name :: String}
+
+    type StatusBucket = [Status]
 
     instance Show Status where
-        show Decaying{..}  = status_id ++ ": " ++ show timer ++ " rounds"
-        show Permanent{..} = status_id
+        show Decaying{..}  = status_name ++ ": " ++ show timer ++ " steps"
+        show Permanent{..} = status_name
+
 
     -- Decay a status if it can decay. Remove fully decayed statuses automatically.
-    decay_status :: Status -> Maybe Status
-    decay_status Decaying{..}
-        | timer == 0 = Nothing
-        | otherwise  = Just $ Decaying status_id (timer - 1)
-    decay_status p = Just p
+    decay_status ::  Flag -> Status -> Maybe Status
+    decay_status f d@Decaying{..}
+        | S.notMember f decay_flags = Just d
+        | timer == 0                = Nothing
+        | otherwise                 = Just $ Decaying status_name (timer - 1) decay_flags
+    decay_status _ p = Just p
 
-    -- Entities can be grouped by initiative score for simplicity.
+
+
+    {-- 
+        An entity is any element that is considered when resolving a round.
+        Single: A single character, player or NPC.
+        Group:  A group of entities that can have their actions resolve in any order.
+                Split into "resolved" and "unresolved" for when turn starts and endings are important
+        Interruption: An event that occurs at a given point in a round, such as "On initiative count 20..." events.
+    --}
     data Entity = Single
-        { entity_id :: String
+        { entity_id        :: EntityID
+        , score            :: InitiativeScore
+        , entity_name      :: String
         , meters    :: Meters
-        , statuses  :: [Status]
         }
-        | Group [Entity]
+        | Group
+        { entity_id  :: EntityID
+        , score      :: InitiativeScore
+        , unresolved :: [Entity]
+        , resolved   :: [Entity]
+        }
         | Interruption
-        { entity_id   :: String
+        { entity_id   :: EntityID
+        , score       :: InitiativeScore
+        , entity_name :: String
         , description :: String
         }
 
     instance Show Entity where
         show Single{..} =
-            entity_id ++ ":\n" ++
+            entity_name ++ ":\n" ++
             "\tMeters:\n" ++
-            (concat $ M.mapWithKey (\k a -> "\t\t" ++ k ++ ": " ++ show a ++ "\n") meters) ++
-            "\tStatuses:\n" ++
-            (concatMap (\s -> "\t\t" ++ show s ++ "\n") statuses)
+            (concat $ M.mapWithKey (\k a -> "\t\t" ++ k ++ ": " ++ show a ++ "\n") meters)
 
-        show (Group es) = concatMap show es
+        show Group{..} = concatMap show $ unresolved ++ resolved
 
-        show Interruption{..} = entity_id ++ ": " ++ description
+        show Interruption{..} = entity_name ++ ": " ++ description
 
-    -- decay any timed statuses
-    step_entity :: Entity -> Entity
-    step_entity i@Interruption {..} = i
-    step_entity (Group es) = Group $ map step_entity es
-    step_entity Single{..} = Single
-        entity_id
-        meters
-        (mapMaybe decay_status statuses)
 
+    --Adjust a specified meter in the entity
     ms_adjust :: Entity -> String -> (Meter -> Meter) -> Entity
     ms_adjust Single{..} m adj = Single
         entity_id
+        score
+        entity_name
         (M.adjust adj m meters)
-        statuses
     ms_adjust _ _ _ = undefined
 
-    --Group two entity types together.
-    entity_union :: Entity -> Entity -> Entity
-    entity_union (Group es1)   (Group es2)   = Group $ es1 ++ es2
-    entity_union e1            (Group es)    = Group (e1:es)
-    entity_union es@(Group _)  e1            = entity_union e1 es
-    entity_union e1            e2            = Group [e1,e2]
+    --Group two entity types together under an ID. Automatically added to "unresolved" sub-group
+    entity_union :: EntityID -> InitiativeScore -> Entity -> Entity -> Entity
+    entity_union i sc (Group _ _ ur1 re1) (Group _ _ ur2 re2) = Group i sc (ur1 ++ ur2) (re1 ++ re2)
+    entity_union i sc e1                  (Group _ _ ur re)   = Group i sc ur           (e1:re)
+    entity_union i sc es@(Group _ _ _ _)  e1                  = entity_union i sc e1 es
+    entity_union i sc e1                  e2                  = Group i sc []           [e1,e2]
+
 
 
     {--
         Initiative is the state of a given combat. There is an initiative counter that counts down
         from the highest rolled number to the lowest, plus any possible interruptions
 
-
     --}
+
+    type EntityPool = Map EntityID Entity
+    type StatusPool = Map EntityID StatusBucket
+
     data Initiative = Initiative
-        { counter  :: InitiativeScore
-        , entities :: Map InitiativeScore Entity
-        , rounds   :: Int
-        }
+        { _counter    :: InitiativeScore
+        , _rounds     :: Int
+        , _entities   :: EntityPool
+        , _statuses   :: StatusPool
+        , _turn_queue :: [(InitiativeScore, EntityID)]
+        , _id_pool    :: [InitiativeScore]
+        } deriving (Show)
 
-    instance Show Initiative where
-        show Initiative{..} =
-            let target = entity_id $ entities M.! counter
-                (o1,o2) = M.partitionWithKey (\k _ -> k <= counter) entities
-                display_init m = concatMap (\(k,e) -> "\t" ++ show k ++ " - " ++ entity_id e ++ "\n") $ M.toDescList m
-            in
-                "ROUND " ++ show rounds ++ ", " ++ target ++ "'s TURN:\n" ++
-                display_init o1 ++
-                display_init o2
+    $(makeLenses ''Initiative)
 
-
-    step_initiative :: Initiative -> Initiative
-    step_initiative Initiative{..} =
-        let next =  listToMaybe $ dropWhile (>= counter) $ reverse $ M.keys entities
+    -- Decay statuses related to the current flag
+    resolve_flag :: Flag -> Initiative -> Initiative
+    resolve_flag f i =
+        let 
+            update_bucket = mapMaybe (decay_status f)
+            updated = M.map update_bucket $ _statuses i
         in
-            case next of
-                Just n -> Initiative
-                    n
-                    (M.adjust step_entity counter entities)
-                    rounds
-                Nothing -> Initiative
-                    (fst $ M.findMax entities)
-                    (M.adjust step_entity counter entities)
-                    (rounds + 1)
+            set statuses updated i
 
-
-    --add an entity to the initiative order, grouping by initiative score
-    add_entity :: Initiative -> InitiativeScore -> Entity -> Initiative
-    add_entity Initiative{..} i e1 =
-        let bucket = entities M.!? i
+    -- Construct the queue from a counter onwards
+    construct_queue :: InitiativeScore -> Initiative -> Initiative
+    construct_queue limit i = 
+        let
+            eipair Single{..}       = (score, entity_id)
+            eipair Group{..}        = (score, entity_id)
+            eipair Interruption{..} = (score, entity_id)
+            sorted =
+                dropWhile (\(s,_) -> s > limit)
+                $ sortOn fst
+                $ map eipair
+                $ M.elems (_entities i)
         in
-            case bucket of
-                Nothing -> Initiative
-                    counter
-                    (M.insert i e1 entities)
-                    rounds
-                Just e2 -> Initiative
-                    counter
-                    (M.insert i (entity_union e1 e2) entities)
-                    rounds
+            set turn_queue sorted i
+    
 
-            
+    --TODO: add entity function. need to automatically merge on shared initiatives, update queue if needed
 
+    {--
+        Functions for controlling the flow of initiative. 
+        Split into turn ends, turn starts and round starts to allow for reactions, ect.
+    --}
 
+    end_turn :: Initiative -> Initiative
+    end_turn i@Initiative{..} =
+        let 
+            ((_,last_e):q) = _turn_queue
+        in
+            set turn_queue q
+            $ resolve_flag (TurnEnd last_e) i
+    
+    --intended to queue every entity. bit hacky but it'll doooo
+    next_round :: Initiative -> Initiative
+    next_round = construct_queue 99999999 . resolve_flag RoundEnd
 
-
-
-
+    next_turn :: Initiative -> Initiative
+    next_turn i@Initiative{..} =
+        let
+            (next_c, next_e) = head _turn_queue
+        in
+            set counter next_c
+            $ resolve_flag (TurnStart next_e) i
