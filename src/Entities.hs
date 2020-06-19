@@ -7,18 +7,19 @@ module Entities where
     import qualified Data.Map as M
     import Data.Set (Set)
     import qualified Data.Set as S
-    import Data.List (sortOn)
 
-    import Data.Maybe (mapMaybe)
-
+    import Data.List  (find, sortOn)
+    import Data.Maybe (mapMaybe, fromMaybe)
+    import Data.Ord   (Down(Down))
+    
     import Lens.Micro.Platform
 
 
 
 
-    type InitiativeScore = Float
+    type InitiativeScore = Rational
     type EntityID = Int
-
+    
 
     {--
         Flags are generated when an event occurs that may affect something in the current combat,
@@ -56,9 +57,7 @@ module Entities where
     -- alter meter
     (>+) :: Meter -> Int -> Meter
     (>+) Uncapped{..} v = Uncapped (value + v)
-    (>+) Capped{..} v
-        | value + v > max_value = Capped max_value   max_value
-        | otherwise             = Capped (value + v) max_value
+    (>+) Capped{..}   v = Capped (min max_value (value + v)) max_value
 
 
     type Meters = Map String Meter
@@ -107,7 +106,7 @@ module Entities where
         { entity_id        :: EntityID
         , score            :: InitiativeScore
         , entity_name      :: String
-        , meters    :: Meters
+        , meters           :: Meters
         }
         | Group
         { entity_id  :: EntityID
@@ -131,6 +130,11 @@ module Entities where
         show Group{..} = concatMap show $ unresolved ++ resolved
 
         show Interruption{..} = entity_name ++ ": " ++ description
+
+    get_id :: Entity -> EntityID
+    get_id Single{..}       = entity_id
+    get_id Group{..}        = entity_id
+    get_id Interruption{..} = entity_id
 
 
     --Adjust a specified meter in the entity
@@ -166,7 +170,7 @@ module Entities where
         , _entities   :: EntityPool
         , _statuses   :: StatusPool
         , _turn_queue :: [(InitiativeScore, EntityID)]
-        , _id_pool    :: [InitiativeScore]
+        , _id_pool    :: [EntityID]
         } deriving (Show)
 
     $(makeLenses ''Initiative)
@@ -181,22 +185,34 @@ module Entities where
             set statuses updated i
 
     -- Construct the queue from a counter onwards
-    construct_queue :: InitiativeScore -> Initiative -> Initiative
+    construct_queue :: Maybe InitiativeScore -> Initiative -> [(InitiativeScore, EntityID)]
     construct_queue limit i = 
         let
             eipair Single{..}       = (score, entity_id)
             eipair Group{..}        = (score, entity_id)
             eipair Interruption{..} = (score, entity_id)
-            sorted =
-                dropWhile (\(s,_) -> s > limit)
-                $ sortOn fst
-                $ map eipair
-                $ M.elems (_entities i)
+            limit' = fromMaybe 99999999 limit
         in
-            set turn_queue sorted i
-    
+            dropWhile (\(s,_) -> s > limit')
+            $ sortOn (Down . fst)
+            $ map eipair
+            $ M.elems (_entities i)
 
-    --TODO: add entity function. need to automatically merge on shared initiatives, update queue if needed
+    -- Add entity to initiative. Automatically merges on shared initiatives, reconstructs the queue
+    -- to allow for updates
+    add_entity :: Entity -> Initiative -> Initiative
+    add_entity e i@Initiative{..} =
+        let
+            mergeID = fmap snd $ find (\(s,_) -> s == score e) $ construct_queue Nothing i
+            i' = case mergeID of
+                Nothing  -> over entities (M.insert (get_id e) e)      i
+                Just mID -> over entities (M.insert mID        merged) i
+                    where
+                        merged = entity_union mID (score e) e $ _entities M.! mID
+        in
+            set turn_queue (construct_queue (Just _counter) i') i'
+
+
 
     {--
         Functions for controlling the flow of initiative. 
@@ -213,7 +229,11 @@ module Entities where
     
     --intended to queue every entity. bit hacky but it'll doooo
     next_round :: Initiative -> Initiative
-    next_round = construct_queue 99999999 . resolve_flag RoundEnd
+    next_round i@Initiative{..} = 
+        let
+            i' = resolve_flag RoundEnd i
+        in
+            set turn_queue (construct_queue Nothing i') i'
 
     next_turn :: Initiative -> Initiative
     next_turn i@Initiative{..} =
